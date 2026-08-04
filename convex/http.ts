@@ -3,11 +3,8 @@ import {WebhookEvent} from "@clerk/nextjs/server"
 import {Webhook} from "svix"
 import {api} from "./_generated/api"
 import {httpAction} from './_generated/server'
-import {GoogleGenerativeAI} from "@google/generative-ai"
 
 const http = httpRouter()
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
 
 http.route({
     path: "/clerk-webhook",
@@ -47,7 +44,7 @@ http.route({
 
         const eventType = evt.type
 
-        
+
 
         if (eventType === "user.created") {
             const { id, first_name, last_name, image_url, email_addresses } = evt.data;
@@ -96,46 +93,92 @@ http.route({
 })
 
 
-
-
-    function validateWorkoutPlan(plan: any) {
-        const validatedPlan = {
-            schedule: plan.schedule,
-            exercises: plan.exercises.map((exercise: any) => ({
-                day: exercise.day,
-                routines: exercise.routines.map((routine: any) => ({
-                    name: routine.name,
-                    sets: typeof routine.sets === "number" ? routine.sets : parseInt(routine.sets) || 1,
-                    reps: typeof routine.reps === "number" ? routine.reps : parseInt(routine.reps) || 10,
-                })),
+// Validasi & normalisasi hasil workout plan dari AI, sesuai schema (field "routine" singular)
+function validateWorkoutPlan(plan: any) {
+    const validatedPlan = {
+        schedule: plan.schedule,
+        exercises: plan.exercises.map((exercise: any) => ({
+            day: exercise.day,
+            routine: exercise.routine.map((r: any) => ({
+                name: r.name,
+                sets: typeof r.sets === "number" ? r.sets : parseInt(r.sets) || 1,
+                reps: typeof r.reps === "number" ? r.reps : parseInt(r.reps) || 10,
             })),
-        }
-        return validatedPlan
+        })),
+    }
+    return validatedPlan
+}
+
+function validateDietPlan(plan: any) {
+    const validatedPlan = {
+        dailyCalories: typeof plan.dailyCalories === "number" ? plan.dailyCalories : parseInt(plan.dailyCalories) || 2000,
+        meals: plan.meals.map((meal: any) => ({
+            name: meal.name,
+            foods: meal.foods,
+        })),
+    }
+    return validatedPlan
+}
+
+// Panggil Groq (Llama 3.3, OpenAI-compatible API) dan balikin JSON yang sudah di-parse
+async function callGroq(prompt: string) {
+    const apiKey = process.env.GROQ_API_KEY
+    if (!apiKey) {
+        throw new Error("GROQ_API_KEY belum di-set di Convex Environment Variables")
     }
 
-
-    function validateDietPlan(plan: any) {
-        const validatedPlan = {
-            dailyCalories: plan.dailyCalories,
-            meals: plan.meals.map((meal: any) => ({
-                name: meal.name,
-                foods: meal.foods,
-            })),
-        }
-        return validatedPlan
-    }
-
-
-
-    http.route({
-        path: "/vapi/generate-program",
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        handler: httpAction(async (ctx, request) => {
-            try {
-                const payload = await request.json()
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+            model: "llama-3.3-70b-versatile",
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.4,
+            response_format: { type: "json_object" },
+        }),
+    })
 
-                const{
-                user_id,
+    if (!response.ok) {
+        const errText = await response.text()
+        throw new Error(`Groq API error: ${response.status} - ${errText}`)
+    }
+
+    const data = await response.json()
+    const rawText: string = data.choices?.[0]?.message?.content || ""
+    const cleaned = rawText.replace(/```json|```/g, "").trim()
+
+    return JSON.parse(cleaned)
+}
+
+http.route({
+    path: "/vapi/generate-program",
+    method: "POST",
+    handler: httpAction(async (ctx, request) => {
+        const body = await request.json()
+
+        // Format webhook Vapi custom tool: message.toolCallList berisi array tool call
+        const toolCall = body?.message?.toolCallList?.[0]
+        const toolCallId: string = toolCall?.id || "unknown"
+
+        try {
+            if (!toolCall) {
+                throw new Error("Tidak ada toolCall ditemukan di payload")
+            }
+
+            // Argumen yang dikumpulkan AI dari percakapan (age, weight, dst)
+            const args = toolCall.function?.arguments || {}
+
+            // user_id dikirim lewat variableValues saat vapi.start() di frontend,
+            // Vapi menyertakannya di message.call.assistantOverrides.variableValues
+            const userId: string =
+                body?.message?.call?.assistantOverrides?.variableValues?.user_id ||
+                args.user_id ||
+                "unknown_user"
+
+            const {
                 age,
                 height,
                 weight,
@@ -143,153 +186,118 @@ http.route({
                 workout_days,
                 fitness_goal,
                 fitness_level,
-                dietary_restrictions,
-                } = payload
+                dietary_restriction,
+            } = args
 
-                console.log("Pembayaran disini:", payload)
+            console.log("Payload tool call diterima:", { userId, age, height, weight, fitness_goal })
 
-                const model = genAI.getGenerativeModel({
-                    model: "gemini-2.0-flash-001",
-                    generationConfig: {
-                        temperature: 0.4,
-                        topP: 0.9,
-                        responseMimeType: "application/json",
-                    },
-                })
+            const workoutPrompt = `Kamu adalah fitness coach berpengalaman. Buatkan program latihan berdasarkan data berikut:
+Umur: ${age}
+Tinggi: ${height} cm
+Berat: ${weight} kg
+Cedera/keterbatasan: ${injuries || "tidak ada"}
+Hari latihan tersedia per minggu: ${workout_days}
+Tujuan fitness: ${fitness_goal}
+Level fitness: ${fitness_level}
 
-                const workoutPrompt = `You are an experienced fitness coach creating a personalized workout plan based on:
-                Age: ${age}
-                Height: ${height}
-                Weight: ${weight}
-                Injuries or limitations: ${injuries}
-                Available days for workout: ${workout_days}
-                Fitness goal: ${fitness_goal}
-                Fitness level: ${fitness_level}
-                
+Sebagai coach profesional:
+- Pertimbangkan pembagian kelompok otot agar tidak overtraining otot yang sama di hari berturut-turut
+- Sesuaikan gerakan dengan level fitness dan hindari gerakan berisiko untuk cedera yang disebutkan
+- Fokuskan latihan sesuai tujuan fitness pengguna
 
-                As a professional coach:
-                - Consider muscle group splits to avoid overtraining the same muscles on consecutive days
-                - Design exercises that match the fitness level and account for any injuries
-                - Structure the workouts to specifically target the user's fitness goal
-                
-                CRITICAL SCHEMA INSTRUCTIONS:
-                - Your output MUST contain ONLY the fields specified below, NO ADDITIONAL FIELDS
-                - "sets" and "reps" MUST ALWAYS be NUMBERS, never strings
-                - For example: "sets": 3, "reps": 10
-                - Do NOT use text like "reps": "As many as possible" or "reps": "To failure"
-                - Instead use specific numbers like "reps": 12 or "reps": 15
-                - For cardio, use "sets": 1, "reps": 1 or another appropriate number
-                - NEVER include strings for numerical fields
-                - NEVER add extra fields not shown in the example below
-                
-                Return a JSON object with this EXACT structure:
-                {
-                    "schedule": ["Monday", "Wednesday", "Friday"],
-                    "exercises": [
-                    {
-                        "day": "Monday",
-                        "routines": [
+ATURAN SCHEMA PENTING:
+- Output HANYA boleh berisi field yang ditentukan, JANGAN tambah field lain
+- "sets" dan "reps" HARUS berupa angka (number), bukan string
+- Contoh benar: "sets": 3, "reps": 10
+- JANGAN pakai teks seperti "reps": "sebanyak mungkin"
+- Untuk cardio, gunakan "sets": 1, "reps": 1 atau angka lain yang sesuai
+
+Balas dengan JSON PERSIS struktur ini, tanpa teks lain:
+{
+  "schedule": ["Senin", "Rabu", "Jumat"],
+  "exercises": [
+    {
+      "day": "Senin",
+      "routine": [
+        { "name": "Nama Gerakan", "sets": 3, "reps": 10 }
+      ]
+    }
+  ]
+}`
+
+            const rawWorkoutPlan = await callGroq(workoutPrompt)
+            const workoutPlan = validateWorkoutPlan(rawWorkoutPlan)
+
+            const dietPrompt = `Kamu adalah nutrition coach berpengalaman. Buatkan rencana diet berdasarkan data berikut:
+Umur: ${age}
+Tinggi: ${height} cm
+Berat: ${weight} kg
+Tujuan fitness: ${fitness_goal}
+Pantangan makanan: ${dietary_restriction || "tidak ada"}
+
+Sebagai nutrition coach profesional:
+- Hitung kebutuhan kalori harian yang sesuai dengan data dan tujuan pengguna
+- Buat rencana makan seimbang dengan distribusi makronutrien yang tepat
+- Sertakan variasi makanan bergizi sambil menghormati pantangan yang disebutkan
+
+ATURAN SCHEMA PENTING:
+- Output HANYA boleh berisi field yang ditentukan, JANGAN tambah field lain seperti "supplements", "macros", atau "notes"
+- "dailyCalories" HARUS berupa angka (number)
+- Setiap meal hanya berisi "name" dan array "foods"
+
+Balas dengan JSON PERSIS struktur ini, tanpa teks lain:
+{
+  "dailyCalories": 2200,
+  "meals": [
+    { "name": "Sarapan", "foods": ["Oatmeal", "Telur rebus"] },
+    { "name": "Makan Siang", "foods": ["Nasi merah", "Ayam panggang", "Sayur"] }
+  ]
+}`
+
+            const rawDietPlan = await callGroq(dietPrompt)
+            const dietPlan = validateDietPlan(rawDietPlan)
+
+            const planName = `${fitness_goal} Plan - ${new Date().toLocaleDateString("id-ID")}`
+
+            const planId = await ctx.runMutation(api.plans.createPlan, {
+                userId,
+                name: planName,
+                workoutPlan,
+                dietPlan,
+                isActive: true,
+            })
+
+            const summary = `Program "${planName}" berhasil dibuat dengan ${workoutPlan.schedule.length} hari latihan per minggu dan target ${dietPlan.dailyCalories} kalori per hari.`
+
+            return new Response(
+                JSON.stringify({
+                    results: [
                         {
-                            "name": "Exercise Name",
-                            "sets": 3,
-                            "reps": 10
-                        }
-                        ]
-                    }
-                    ]
-                }
-                
-                DO NOT add any fields that are not in this example. Your response must be a valid JSON object with no additional text.`
-
-                const workoutResult = await model.generateContent(workoutPrompt)
-                const workoutPlanText = workoutResult.response.text()
-
-                // Validasi input dari AI
-                let workoutPlan = JSON.parse(workoutPlanText)
-                workoutPlan = validateWorkoutPlan(workoutPlan)
-
-                const dietPrompt = `You are an experienced nutrition coach creating a personalized diet plan based on:
-                Age: ${age}
-                Height: ${height}
-                Weight: ${weight}
-                Fitness goal: ${fitness_goal}
-                Dietary restrictions: ${dietary_restrictions}
-                
-                As a professional nutrition coach:
-                - Calculate appropriate daily calorie intake based on the person's stats and goals
-                - Create a balanced meal plan with proper macronutrient distribution
-                - Include a variety of nutrient-dense foods while respecting dietary restrictions
-                - Consider meal timing around workouts for optimal performance and recovery
-                
-                CRITICAL SCHEMA INSTRUCTIONS:
-                - Your output MUST contain ONLY the fields specified below, NO ADDITIONAL FIELDS
-                - "dailyCalories" MUST be a NUMBER, not a string
-                - DO NOT add fields like "supplements", "macros", "notes", or ANYTHING else
-                - ONLY include the EXACT fields shown in the example below
-                - Each meal should include ONLY a "name" and "foods" array
-
-                Return a JSON object with this EXACT structure and no other fields:
-                {
-                "dailyCalories": 2000,
-                "meals": [
-                    {
-                    "name": "Breakfast",
-                    "foods": ["Oatmeal with berries", "Greek yogurt", "Black coffee"]
-                    },
-                    {
-                    "name": "Lunch",
-                    "foods": ["Grilled chicken salad", "Whole grain bread", "Water"]
-                    }
-                ]
-                }
-                
-                DO NOT add any fields that are not in this example. Your response must be a valid JSON object with no additional text.`;
-
-                const dietResult = await model.generateContent(dietPrompt)
-                const dietPlanText = dietResult.response.text()
-
-                // VALIDASI INPUUT DARI AI
-                let dietPlan = JSON.parse(dietPlanText)
-                dietPlan = validateDietPlan(dietPlan)
-
-                // save untuk DB: CONVEX
-                const planId = await ctx.runMutation(api.plans.createPlan, {
-                    userId: user_id,
-                    dietPlan: user_id,
-                    isActive: true,
-                    workoutPlan,
-                    name: `${fitness_goal} Plan - ${new Date().toLocaleDateString()}`,
-                })
-                
-
-                return new Response(
-                    JSON.stringify({
-                        succes: true,
-                        data: {
-                            planId,
-                            workoutPlan,
-                            dietPlan,
+                            toolCallId,
+                            result: summary,
                         },
-                    }),
-                    {
-                        status: 200,
-                        headers: { "Content-Type": "application/json" },
-                    }
-                )
-            } catch (error) {
-                console.error("Error saat membuat rencana fitness:", error)
-                return new Response(
-                    JSON.stringify({
-                        succes: false,
-                        error: error instanceof Error ? error.message : String(error),
-                    }),
-                    {
-                        status: 500,
-                        headers: { "Content-Type" : "application/json"},
-                    }
-                )
-            }
-        }),
-    })
+                    ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } }
+            )
+        } catch (error) {
+            console.error("Error saat membuat rencana fitness:", error)
+
+            return new Response(
+                JSON.stringify({
+                    results: [
+                        {
+                            toolCallId,
+                            result: `Maaf, terjadi kesalahan saat membuat program: ${
+                                error instanceof Error ? error.message : String(error)
+                            }`,
+                        },
+                    ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } }
+            )
+        }
+    }),
+})
 
 export default http

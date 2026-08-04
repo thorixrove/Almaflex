@@ -24,9 +24,11 @@ const GenerateProgramPage = () => {
     //menimpa console.error untuk mengabaikan error 'Meeting has ended
     console.error = function (msg, ...args) {
       if(
-        msg &&
-        (msg.includes("Pertemuan telah selesai") ||
-      (args[0] && args[0].toString().includes("Pertemuan telah selesai"))) 
+      msg &&
+      (msg.includes("Pertemuan telah selesai") ||
+       msg.includes("Meeting has ended") ||
+       (args[0] && args[0].toString().includes("Pertemuan telah selesai")) ||
+       (args[0] && args[0].toString().includes("Meeting has ended")))
       ) {
         console.log("Mengabaikan error yang diketahui: Rapat telah berakhir")
         return
