@@ -12,12 +12,14 @@ export default defineSchema({
     plans: defineTable({
         userId: v.string(),
         name: v.string(),
+
+
         workoutPlan: v.object({
             schedule: v.array(v.string()),
-            exercise: v.array(
+            exercises: v.array(
                 v.object({
                     day: v.string(),
-                    routines: v.array(
+                    routine: v.array(
                         v.object({
                             name: v.string(),
                             sets: v.optional(v.number()),
