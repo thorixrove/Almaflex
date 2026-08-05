@@ -294,7 +294,7 @@ Balas dengan JSON PERSIS struktur ini, tanpa teks lain:
                         },
                     ],
                 }),
-                { status: 200, headers: { "Content-Type": "application/json" } }
+                { status: 500, headers: { "Content-Type": "application/json" } }
             )
         }
     }),
