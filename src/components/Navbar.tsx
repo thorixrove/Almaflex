@@ -73,11 +73,11 @@ const Navbar = () => {
                         </Button>
                     </SignInButton>
 
-                    <SignUpButton>
-                        <Button  className="border-primary/50 text-primary hover:text-white hover:bg-primary/10">
-                            Sign Up
-                        </Button>
-                    </SignUpButton>
+              <SignUpButton>
+                <Button className="bg-primary text-primary-foreground hover:bg-primary/90">
+                  Sign Up
+                </Button>
+              </SignUpButton>
                     </>
                 )}
                </nav>
